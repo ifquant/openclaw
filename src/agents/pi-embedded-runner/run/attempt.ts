@@ -424,6 +424,20 @@ function summarizeSessionContext(messages: AgentMessage[]): {
   };
 }
 
+/**
+ * 执行一次已经完成前置准备的 embedded agent 尝试。
+ *
+ * 这个函数是 OpenClaw 本地运行时外壳与外部 pi-coding-agent core 之间的主装配边界：
+ * - 准备 workspace 与 sandbox 视图
+ * - 解析 skills、bootstrap context、tools 与 system prompt 输入
+ * - 修复并打开持久化的 session transcript
+ * - 创建 embedded agent session，并为不同 provider 包装 stream 行为
+ * - 订阅运行时事件，然后真正发起 prompt
+ * - 等待 compaction / retry 收尾，最后返回稳定的运行后快照
+ *
+ * 外层 `runEmbeddedPiAgent` 负责 lane 调度、model/profile 重试与 failover。
+ * 这个函数只负责在 provider/model 已经确定之后的一次具体尝试。
+ */
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
 ): Promise<EmbeddedRunAttemptResult> {
@@ -437,6 +451,8 @@ export async function runEmbeddedAttempt(
 
   await fs.mkdir(resolvedWorkspace, { recursive: true });
 
+  // 先确定本次运行看到的文件系统视图。后续所有步骤都必须共享同一个
+  // effective workspace，否则 agent 看到的路径与工具实际操作的路径会脱节。
   const sandboxSessionKey = params.sessionKey?.trim() || params.sessionId;
   const sandbox = await resolveSandboxContext({
     config: params.config,
@@ -453,6 +469,8 @@ export async function runEmbeddedAttempt(
   let restoreSkillEnv: (() => void) | undefined;
   process.chdir(effectiveWorkspace);
   try {
+    // skills 与 bootstrap 文件必须在 session 装载前就准备好，
+    // 这样 prompt builder 才能看到与工具执行相同的 workspace 上下文。
     const shouldLoadSkillEntries = !params.skillsSnapshot || !params.skillsSnapshot.resolvedSkills;
     const skillEntries = shouldLoadSkillEntries
       ? loadWorkspaceSkillEntries(effectiveWorkspace)
@@ -500,6 +518,9 @@ export async function runEmbeddedAttempt(
       config: params.config,
       sessionAgentId,
     });
+    // 工具构造是 OpenClaw 外壳层最关键的职责之一：
+    // 最终可见的工具集合并不是固定列表，而是由 session 作用域、sandbox 模式、
+    // 渠道路由、发送者权限与 provider 兼容性共同决定的。
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
     const toolsRaw = params.disableTools
@@ -704,6 +725,8 @@ export async function runEmbeddedAttempt(
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
     let systemPromptText = systemPromptOverride();
 
+    // session lock 放在 prompt/tool/runtime 输入都准备好之后再加，
+    // 这样锁持有时间就能尽量集中在 transcript 变更与 agent 执行阶段。
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
       maxHoldMs: resolveSessionLockMaxHoldFromTimeout({
@@ -748,6 +771,9 @@ export async function runEmbeddedAttempt(
         cwd: effectiveWorkspace,
       });
 
+      // settings / extensions 要在 createAgentSession 之前解析好，
+      // 这样外部 agent core 一开始就带着 OpenClaw 的 compaction、pruning
+      // 与运行时装配状态启动，而不是事后再补丁式接入。
       const settingsManager = createPreparedEmbeddedPiSettingsManager({
         cwd: effectiveWorkspace,
         agentDir,
@@ -806,6 +832,8 @@ export async function runEmbeddedAttempt(
 
       const allCustomTools = [...customTools, ...clientToolDefs];
 
+      // 到这里才是真正把前面准备好的本地运行壳状态交给外部 agent core。
+      // 后面的大部分逻辑，都会围绕这个 session 的输入输出做约束、观测和清洗。
       ({ session } = await createAgentSession({
         cwd: resolvedWorkspace,
         agentDir,
@@ -855,6 +883,9 @@ export async function runEmbeddedAttempt(
         workspaceDir: params.workspaceDir,
       });
 
+      // provider 兼容包装放在 streamFn 上，而不是放在外层 run loop，
+      // 因为 retry、tool continuation、tool 后续回合都会复用同一个 agent session。
+      // 这样每一次对 provider 的出站请求都会自动经过同一套清洗与兼容规则。
       // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
       // for reliable streaming + tool calling support (#11828).
       if (params.model.api === "ollama") {
@@ -972,6 +1003,8 @@ export async function runEmbeddedAttempt(
       }
 
       try {
+        // 历史 session 清洗必须在 session 创建之后进行，
+        // 因为 transcript policy 依赖本次尝试最终解析出来的 provider / model 路径。
         const prior = await sanitizeSessionHistory({
           messages: activeSession.messages,
           modelApi: params.model.api,
@@ -1065,6 +1098,9 @@ export async function runEmbeddedAttempt(
         });
       };
 
+      // subscription 是 provider 流被翻译成 OpenClaw 运行时事件的关键适配层：
+      // partial text、tool metadata、reasoning output、compaction 状态与消息投递副作用
+      // 都通过它被观察和转发，而不是直接从 pi-agent-core 裸读。
       const subscription = subscribeEmbeddedPiSession({
         session: activeSession,
         runId: params.runId,
@@ -1183,6 +1219,8 @@ export async function runEmbeddedAttempt(
       try {
         const promptStartedAt = Date.now();
 
+        // 在真正调用 provider 之前，hook 还有最后一次机会调整本轮 prompt 输入。
+        // 这时 session、tools 与基础 system prompt 都已经存在，但 prompt() 还未发出。
         // Run before_prompt_build hooks to allow plugins to inject prompt context.
         // Legacy compatibility: before_agent_start is also checked for context fields.
         let effectivePrompt = params.prompt;
@@ -1329,6 +1367,9 @@ export async function runEmbeddedAttempt(
           );
         }
 
+        // prompt() 返回后，compaction 仍可能异步改写 transcript。
+        // 所以必须在 compaction/retry 窗口稳定下来之后，才能采集最终快照；
+        // 否则调用方看到的会是半压缩或结构尚未稳定的历史。
         // Capture snapshot before compaction wait so we have complete messages if timeout occurs
         // Check compaction state before and after to avoid race condition where compaction starts during capture
         // Use session state (not subscription) for snapshot decisions - need instantaneous compaction status
@@ -1534,6 +1575,9 @@ export async function runEmbeddedAttempt(
         clientToolCall: clientToolCallDetected ?? undefined,
       };
     } finally {
+      // transcript 侧资源按安装的逆序释放：
+      // 先移除自定义 guard，再冲刷 pending tool result，再 dispose agent session，
+      // 最后释放 session 文件锁。
       // Always tear down the session (and release the lock) before we leave this attempt.
       //
       // BUGFIX: Wait for the agent to be truly idle before flushing pending tool results.
