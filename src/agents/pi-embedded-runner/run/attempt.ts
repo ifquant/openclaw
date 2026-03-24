@@ -151,8 +151,9 @@ export function isOllamaCompatProvider(model: {
       return true;
     }
 
-    // Allow remote/LAN Ollama OpenAI-compatible endpoints when the provider id
-    // itself indicates Ollama usage (e.g. "my-ollama").
+    // 允许远端 / 局域网里的 Ollama OpenAI 兼容端点。
+    // 只要 provider id 本身就明确暗示它是 Ollama（例如 `my-ollama`），
+    // 即使地址不是 localhost，也仍按 Ollama 兼容模式处理。
     const providerHintsOllama = providerId.includes("ollama");
     const isOllamaPort = parsed.port === "11434";
     const isOllamaCompatPath = parsed.pathname === "/" || /^\/v1\/?$/i.test(parsed.pathname);
@@ -192,7 +193,8 @@ export function shouldInjectOllamaCompatNumCtx(params: {
   config?: OpenClawConfig;
   providerId?: string;
 }): boolean {
-  // Restrict to the OpenAI-compatible adapter path only.
+  // 这里只针对“通过 OpenAI 兼容适配层接入的 Ollama”注入 num_ctx。
+  // 原生 API 或其他 provider 不走这条兼容补丁。
   if (params.model.api !== "openai-completions") {
     return false;
   }
@@ -459,6 +461,10 @@ export async function runEmbeddedAttempt(
     sessionKey: sandboxSessionKey,
     workspaceDir: resolvedWorkspace,
   });
+  // effectiveWorkspace 是这次运行真正要 `chdir` 进去、并交给后续工具/agent 使用的目录：
+  // - 没开 sandbox：直接使用用户请求的 workspace
+  // - 开了 sandbox 且有读写工作区权限：仍然使用原 workspace
+  // - 开了 sandbox 但工作区不是读写直通：切到 sandbox 暴露给 agent 的目录视图
   const effectiveWorkspace = sandbox?.enabled
     ? sandbox.workspaceAccess === "rw"
       ? resolvedWorkspace
@@ -521,7 +527,8 @@ export async function runEmbeddedAttempt(
     // 工具构造是 OpenClaw 外壳层最关键的职责之一：
     // 最终可见的工具集合并不是固定列表，而是由 session 作用域、sandbox 模式、
     // 渠道路由、发送者权限与 provider 兼容性共同决定的。
-    // Check if the model supports native image input
+    // 这里先判断模型是否原生支持图片输入，后面 tool/prompt 都会据此决定
+    // 是否暴露图片相关能力，以及要不要走图片清洗与注入链路。
     const modelHasVision = params.model.input?.includes("image") ?? false;
     const toolsRaw = params.disableTools
       ? []
@@ -620,7 +627,8 @@ export async function runEmbeddedAttempt(
         : undefined;
     const sandboxInfo = buildEmbeddedSandboxInfo(sandbox, params.bashElevated);
     const reasoningTagHint = isReasoningTagProvider(params.provider);
-    // Resolve channel-specific message actions for system prompt
+    // 渠道能力不只是给消息工具用，system prompt 也会把“这个渠道到底支持哪些动作”
+    // 明确告诉模型，避免 agent 凭空假设某个渠道能发按钮、反应或富文本。
     const channelActions = runtimeChannel
       ? listChannelSupportedActions({
           cfg: params.config,
@@ -780,8 +788,9 @@ export async function runEmbeddedAttempt(
         cfg: params.config,
       });
 
-      // Sets compaction/pruning runtime state and returns extension factories
-      // that must be passed to the resource loader for the safeguard to be active.
+      // 这里会把 compaction / pruning 的运行时状态写进 settings 与扩展工厂。
+      // 只有把这些 factory 一并交给 resource loader，后续的资源加载链路里
+      // 才会真的挂上对应的护栏与收缩策略。
       const extensionFactories = buildEmbeddedExtensionFactories({
         cfg: params.config,
         sessionManager,
@@ -789,8 +798,8 @@ export async function runEmbeddedAttempt(
         modelId: params.modelId,
         model: params.model,
       });
-      // Only create an explicit resource loader when there are extension factories
-      // to register; otherwise let createAgentSession use its built-in default.
+      // 没有扩展工厂时，不必额外显式创建 resource loader；
+      // 直接让 createAgentSession 走它自己的默认实现即可，避免多包一层空装配。
       let resourceLoader: DefaultResourceLoader | undefined;
       if (extensionFactories.length > 0) {
         resourceLoader = new DefaultResourceLoader({
@@ -802,7 +811,9 @@ export async function runEmbeddedAttempt(
         await resourceLoader.reload();
       }
 
-      // Get hook runner early so it's available when creating tools
+      // hook runner 要在 createAgentSession 之前拿到。
+      // 一方面 tools 可能会被 hook 包装，另一方面后面的 prompt/session 生命周期
+      // 也都要复用同一套 runner。
       const hookRunner = getGlobalHookRunner();
 
       const { builtInTools, customTools } = splitSdkTools({
@@ -810,7 +821,9 @@ export async function runEmbeddedAttempt(
         sandboxEnabled: !!sandbox?.enabled,
       });
 
-      // Add client tools (OpenResponses hosted tools) to customTools
+      // client tools 是宿主侧托管工具定义，不属于 pi-agent-core 内建工具。
+      // 这里把它们并进 customTools，让本地工具和 OpenResponses 托管工具
+      // 在同一轮 agent run 里一起参与调度。
       let clientToolCallDetected: { name: string; params: Record<string, unknown> } | null = null;
       const clientToolLoopDetection = resolveToolLoopDetectionConfig({
         cfg: params.config,
@@ -886,10 +899,11 @@ export async function runEmbeddedAttempt(
       // provider 兼容包装放在 streamFn 上，而不是放在外层 run loop，
       // 因为 retry、tool continuation、tool 后续回合都会复用同一个 agent session。
       // 这样每一次对 provider 的出站请求都会自动经过同一套清洗与兼容规则。
-      // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
-      // for reliable streaming + tool calling support (#11828).
+      // 对 Ollama 原生 API 这里直接绕过 SDK 的 streamSimple，改走 /api/chat，
+      // 否则流式输出和 tool calling 都容易出现兼容性问题。
       if (params.model.api === "ollama") {
-        // Use the resolved model baseUrl first so custom provider aliases work.
+        // 先尊重模型自身解析出来的 baseUrl，再回退到 provider 配置，
+        // 这样自定义 provider alias 仍然能把请求打到正确的 Ollama 实例。
         const providerConfig = params.config?.models?.providers?.[params.model.provider];
         const modelBaseUrl =
           typeof params.model.baseUrl === "string" ? params.model.baseUrl.trim() : "";
@@ -898,12 +912,12 @@ export async function runEmbeddedAttempt(
         const ollamaBaseUrl = modelBaseUrl || providerBaseUrl || OLLAMA_NATIVE_BASE_URL;
         activeSession.agent.streamFn = createOllamaStreamFn(ollamaBaseUrl);
       } else {
-        // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
+        // 非 Ollama 场景统一固定成 streamSimple 引用，方便测试环境稳定 mock。
         activeSession.agent.streamFn = streamSimple;
       }
 
-      // Ollama with OpenAI-compatible API needs num_ctx in payload.options.
-      // Otherwise Ollama defaults to a 4096 context window.
+      // 某些 Ollama 兼容 OpenAI API 的接入方式不会自动继承上下文窗口，
+      // 不手动注入 `num_ctx` 时，Ollama 会退回自己的默认 4096。
       const providerIdForNumCtx =
         typeof params.model.provider === "string" && params.model.provider.trim().length > 0
           ? params.model.provider
@@ -942,9 +956,9 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
       }
 
-      // Copilot/Claude can reject persisted `thinking` blocks (e.g. thinkingSignature:"reasoning_text")
-      // on *any* follow-up provider call (including tool continuations). Wrap the stream function
-      // so every outbound request sees sanitized messages.
+      // Copilot / Claude 一类 provider 会拒绝历史里残留的 thinking block。
+      // 问题不只发生在首轮 prompt，后续 tool continuation 也会踩到；
+      // 所以要包在 streamFn 上，保证每一次出站请求都看到清洗后的消息。
       if (transcriptPolicy.dropThinkingBlocks) {
         const inner = activeSession.agent.streamFn;
         activeSession.agent.streamFn = (model, context, options) => {
@@ -965,11 +979,10 @@ export async function runEmbeddedAttempt(
         };
       }
 
-      // Mistral (and other strict providers) reject tool call IDs that don't match their
-      // format requirements (e.g. [a-zA-Z0-9]{9}). sanitizeSessionHistory only processes
-      // historical messages at attempt start, but the agent loop's internal tool call →
-      // tool result cycles bypass that path. Wrap streamFn so every outbound request
-      // sees sanitized tool call IDs.
+      // Mistral 这类更严格的 provider 会校验 tool call id 格式。
+      // 而 sanitizeSessionHistory 只能处理“尝试开始前”已经落盘的历史，
+      // agent loop 运行中的 tool call -> tool result 循环并不会再走那条路径，
+      // 因此这里也要包在 streamFn 上，保证运行中产生的消息同样被修正。
       if (transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode) {
         const inner = activeSession.agent.streamFn;
         const mode = transcriptPolicy.toolCallIdMode;
@@ -991,9 +1004,9 @@ export async function runEmbeddedAttempt(
         };
       }
 
-      // Some models emit tool names with surrounding whitespace (e.g. " read ").
-      // pi-agent-core dispatches tool calls with exact string matching, so normalize
-      // names on the live response stream before tool execution.
+      // 有些模型会把工具名带上首尾空格，例如 `" read "`。
+      // pi-agent-core 是按精确字符串派发工具的，所以必须在实时流上先修正，
+      // 不然工具明明存在，也会因为名字不完全相等而找不到。
       activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(activeSession.agent.streamFn);
 
       if (anthropicPayloadLogger) {
@@ -1027,9 +1040,9 @@ export async function runEmbeddedAttempt(
           validated,
           getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
         );
-        // Re-run tool_use/tool_result pairing repair after truncation, since
-        // limitHistoryTurns can orphan tool_result blocks by removing the
-        // assistant message that contained the matching tool_use.
+        // 截断历史后要再跑一遍 tool_use/tool_result 配对修复。
+        // 否则 limitHistoryTurns 可能删掉携带 tool_use 的 assistant message，
+        // 却把后面的 tool_result 留下来，形成悬空结果块。
         const limited = transcriptPolicy.repairToolUseResultPairing
           ? sanitizeToolUseResultPairing(truncated)
           : truncated;
@@ -1049,8 +1062,12 @@ export async function runEmbeddedAttempt(
       let aborted = Boolean(params.abortSignal?.aborted);
       let timedOut = false;
       let timedOutDuringCompaction = false;
+      // 统一从 AbortSignal 上取 reason，避免到处散落兼容判断。
+      // Node 新旧版本 / 不同实现对 signal.reason 的可用性并不完全一致。
       const getAbortReason = (signal: AbortSignal): unknown =>
         "reason" in signal ? (signal as { reason?: unknown }).reason : undefined;
+      // 超时和普通取消最终都会走同一条 abortRun 路径，但超时要带上明确错误类型，
+      // 这样上层才能区分“用户取消”与“系统超时”。
       const makeTimeoutAbortReason = (): Error => {
         const err = new Error("request timed out");
         err.name = "TimeoutError";
@@ -1074,6 +1091,9 @@ export async function runEmbeddedAttempt(
         }
         void activeSession.abort();
       };
+      // 把任意异步步骤变成“可被 runAbortController 打断”的 promise 包装器。
+      // prompt()、waitForCompactionRetry() 等原生 promise 未必自己监听 abort，
+      // 所以这里需要额外做一层竞态包装。
       const abortable = <T>(promise: Promise<T>): Promise<T> => {
         const signal = runAbortController.signal;
         if (signal.aborted) {
@@ -1211,7 +1231,8 @@ export async function runEmbeddedAttempt(
         }
       }
 
-      // Hook runner was already obtained earlier before tool creation
+      // 这里只是把前面拿到的 hook runner 对应的 agentId 固定下来，避免后面
+      // 在 prompt / end hook 阶段再回头推导一次。
       const hookAgentId = sessionAgentId;
 
       let promptError: unknown = null;
@@ -1221,8 +1242,8 @@ export async function runEmbeddedAttempt(
 
         // 在真正调用 provider 之前，hook 还有最后一次机会调整本轮 prompt 输入。
         // 这时 session、tools 与基础 system prompt 都已经存在，但 prompt() 还未发出。
-        // Run before_prompt_build hooks to allow plugins to inject prompt context.
-        // Legacy compatibility: before_agent_start is also checked for context fields.
+        // 这里同时兼容 before_prompt_build 与旧版 before_agent_start，
+        // 让老插件还能继续向 prompt 注入上下文。
         let effectivePrompt = params.prompt;
         const hookCtx = {
           agentId: hookAgentId,
@@ -1260,7 +1281,8 @@ export async function runEmbeddedAttempt(
           messages: activeSession.messages,
         });
 
-        // Repair orphaned trailing user messages so new prompts don't violate role ordering.
+        // 如果 transcript 末尾意外残留一个孤立 user turn，新 prompt 再进去就会变成
+        // 连续两个 user message，很多 provider 会直接拒绝这种 role 排序。
         const leafEntry = sessionManager.getLeafEntry();
         if (leafEntry?.type === "message" && leafEntry.message.role === "user") {
           if (leafEntry.parentId) {
@@ -1277,15 +1299,15 @@ export async function runEmbeddedAttempt(
         }
 
         try {
-          // Idempotent cleanup for legacy sessions with persisted image payloads.
-          // Called each run; only mutates already-answered user turns that still carry image blocks.
+          // 旧 session 可能把图片 payload 长期留在历史里，导致上下文越来越重。
+          // 这里每轮都做一次幂等清理，只会改那些“已经回答完但还挂着图片块”的 user turn。
           const didPruneImages = pruneProcessedHistoryImages(activeSession.messages);
           if (didPruneImages) {
             activeSession.agent.replaceMessages(activeSession.messages);
           }
 
-          // Detect and load images referenced in the prompt for vision-capable models.
-          // Images are prompt-local only (pi-like behavior).
+          // 只有模型支持视觉输入时，才把 prompt 中引用到的图片解析出来并载入。
+          // 这些图片只对当前 prompt 生效，不会自动写回长期 session 历史。
           const imageResult = await detectAndLoadPromptImages({
             prompt: effectivePrompt,
             workspaceDir: effectiveWorkspace,
@@ -1294,7 +1316,7 @@ export async function runEmbeddedAttempt(
             maxBytes: MAX_IMAGE_BYTES,
             maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
             workspaceOnly: effectiveFsWorkspaceOnly,
-            // Enforce sandbox path restrictions when sandbox is enabled
+            // sandbox 开启时，图片路径也必须走 sandbox 的可见路径限制。
             sandbox:
               sandbox?.enabled && sandbox?.fsBridge
                 ? { root: sandbox.workspaceDir, bridge: sandbox.fsBridge }
@@ -1307,7 +1329,7 @@ export async function runEmbeddedAttempt(
             note: `images: prompt=${imageResult.images.length}`,
           });
 
-          // Diagnostic: log context sizes before prompt to help debug early overflow errors.
+          // 这里记录上下文体积诊断，主要用于排查“请求一发出就超窗口”的问题。
           if (log.isEnabled("debug")) {
             const msgCount = activeSession.messages.length;
             const systemLen = systemPromptText?.length ?? 0;
@@ -1351,8 +1373,8 @@ export async function runEmbeddedAttempt(
               });
           }
 
-          // Only pass images option if there are actually images to pass
-          // This avoids potential issues with models that don't expect the images parameter
+          // 没有图片时不要传 `images` 字段，避免某些模型/SDK 在看到空图片参数时
+          // 走到不兼容分支。
           if (imageResult.images.length > 0) {
             await abortable(activeSession.prompt(effectivePrompt, { images: imageResult.images }));
           } else {
@@ -1370,13 +1392,12 @@ export async function runEmbeddedAttempt(
         // prompt() 返回后，compaction 仍可能异步改写 transcript。
         // 所以必须在 compaction/retry 窗口稳定下来之后，才能采集最终快照；
         // 否则调用方看到的会是半压缩或结构尚未稳定的历史。
-        // Capture snapshot before compaction wait so we have complete messages if timeout occurs
-        // Check compaction state before and after to avoid race condition where compaction starts during capture
-        // Use session state (not subscription) for snapshot decisions - need instantaneous compaction status
+        // 这里会先抢拍一份“压缩前快照”，专门用于处理“压缩过程中超时”的兜底场景。
+        // compaction 状态前后各检查一次，是为了避免拍快照时刚好与 compaction 起跑撞车。
         const wasCompactingBefore = activeSession.isCompacting;
         const snapshot = activeSession.messages.slice();
         const wasCompactingAfter = activeSession.isCompacting;
-        // Only trust snapshot if compaction wasn't running before or after capture
+        // 只有拍快照前后都没在 compacting，才信任这份快照是稳定的。
         const preCompactionSnapshot = wasCompactingBefore || wasCompactingAfter ? null : snapshot;
         const preCompactionSessionId = activeSession.sessionId;
 
@@ -1400,12 +1421,10 @@ export async function runEmbeddedAttempt(
 
         const compactionOccurredThisAttempt = getCompactionCount() > 0;
 
-        // Append cache-TTL timestamp AFTER prompt + compaction retry completes.
-        // Previously this was before the prompt, which caused a custom entry to be
-        // inserted between compaction and the next prompt — breaking the
-        // prepareCompaction() guard that checks the last entry type, leading to
-        // double-compaction. See: https://github.com/openclaw/openclaw/issues/9282
-        // Skip when timed out during compaction — session state may be inconsistent.
+        // cache-TTL 时间戳必须等 prompt 和 compaction retry 都结束后再写。
+        // 之前若写得太早，会在 compaction 与下一轮 prompt 之间插入自定义 entry，
+        // 破坏 prepareCompaction() 对“最后一条 entry 类型”的假设，诱发二次 compaction。
+        // 如果正好在 compaction 中超时，这里直接跳过，避免继续污染不稳定 session。
         if (!timedOutDuringCompaction && !compactionOccurredThisAttempt) {
           const shouldTrackCacheTtl =
             params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl" &&
@@ -1419,8 +1438,8 @@ export async function runEmbeddedAttempt(
           }
         }
 
-        // If timeout occurred during compaction, use pre-compaction snapshot when available
-        // (compaction restructures messages but does not add user/assistant turns).
+        // 若超时发生在 compaction 中，优先退回压缩前快照。
+        // 因为 compaction 会重排/折叠消息结构，但不会凭空新增 user/assistant 轮次。
         const snapshotSelection = selectCompactionTimeoutSnapshot({
           timedOutDuringCompaction,
           preCompactionSnapshot,
@@ -1464,9 +1483,9 @@ export async function runEmbeddedAttempt(
         });
         anthropicPayloadLogger?.recordUsage(messagesSnapshot, promptError);
 
-        // Run agent_end hooks to allow plugins to analyze the conversation
-        // This is fire-and-forget, so we don't await
-        // Run even on compaction timeout so plugins can log/cleanup
+        // agent_end hook 是收尾观察点：插件可以在这里做分析、埋点或清理。
+        // 这里故意 fire-and-forget，不阻塞主流程；即便 compaction 超时也照样触发，
+        // 让外部插件至少能拿到一次结束态。
         if (hookRunner?.hasHooks("agent_end")) {
           hookRunner
             .runAgentEnd(
@@ -1501,9 +1520,8 @@ export async function runEmbeddedAttempt(
         try {
           unsubscribe();
         } catch (err) {
-          // unsubscribe() should never throw; if it does, it indicates a serious bug.
-          // Log at error level to ensure visibility, but don't rethrow in finally block
-          // as it would mask any exception from the try block above.
+          // unsubscribe() 理论上不该抛错；一旦抛错，通常意味着订阅清理存在严重缺陷
+          // 或潜在资源泄漏。这里只记录 error，不再向外抛，避免把真正的主异常盖掉。
           log.error(
             `CRITICAL: unsubscribe failed, possible resource leak: runId=${params.runId} ${String(err)}`,
           );
@@ -1571,21 +1589,22 @@ export async function runEmbeddedAttempt(
         ),
         attemptUsage: getUsageTotals(),
         compactionCount: getCompactionCount(),
-        // Client tool call detected (OpenResponses hosted tools)
+        // 记录本轮是否触发了宿主侧托管 client tool，方便上层区分
+        // “本地工具执行”与“OpenResponses 托管工具执行”。
         clientToolCall: clientToolCallDetected ?? undefined,
       };
     } finally {
       // transcript 侧资源按安装的逆序释放：
       // 先移除自定义 guard，再冲刷 pending tool result，再 dispose agent session，
       // 最后释放 session 文件锁。
-      // Always tear down the session (and release the lock) before we leave this attempt.
+      // 无论成功、失败还是超时，离开这次 attempt 前都必须先把 session 真正拆干净，
+      // 否则 transcript 文件锁和 agent 资源会泄漏到下一轮。
       //
-      // BUGFIX: Wait for the agent to be truly idle before flushing pending tool results.
-      // pi-agent-core's auto-retry resolves waitForRetry() on assistant message receipt,
-      // *before* tool execution completes in the retried agent loop. Without this wait,
-      // flushPendingToolResults() fires while tools are still executing, inserting
-      // synthetic "missing tool result" errors and causing silent agent failures.
-      // See: https://github.com/openclaw/openclaw/issues/8643
+      // 这里特意等 agent 进入真正 idle 状态后，再冲刷 pending tool result。
+      // 原因是 pi-agent-core 的 auto-retry 在“收到 assistant message”时就可能让
+      // waitForRetry() 提前结束，但那时重试回合里的工具执行还没完全跑完。
+      // 如果此时就 flush，会错误插入 synthetic 的“missing tool result”，
+      // 最终表现成无声失败或难以理解的 transcript 污染。
       removeToolResultContextGuard?.();
       await flushPendingToolResultsAfterIdle({
         agent: session?.agent,

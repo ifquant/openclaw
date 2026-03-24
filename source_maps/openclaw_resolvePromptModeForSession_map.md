@@ -7,7 +7,7 @@
 - 为什么 subagent 会走 `minimal`，普通主会话走 `full`
 - 它在 `runEmbeddedAttempt` 和 compaction 里起什么作用
 
-如果 [`source_maps/openclaw_sessionkey_design_map.md`](/Users/dev/workspace2/claw_research/source_maps/openclaw_sessionkey_design_map.md) 讲的是 `sessionKey` 是什么，那么这份文档讲的是：
+如果 [`source_maps/openclaw_sessionkey_design_map.md`](/Users/dev/workspace2/agents_research/source_maps/openclaw_sessionkey_design_map.md) 讲的是 `sessionKey` 是什么，那么这份文档讲的是：
 
 ```text
 sessionKey 的某种语义
@@ -37,22 +37,22 @@ sessionKey 的某种语义
 
 主函数在：
 
-- [`openclaw/src/agents/pi-embedded-runner/run/attempt.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/run/attempt.ts)
+- [`openclaw/src/agents/pi-embedded-runner/run/attempt.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/run/attempt.ts)
 
 真正消费 `promptMode` 的地方在：
 
-- [`openclaw/src/agents/pi-embedded-runner/system-prompt.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/system-prompt.ts)
-- [`openclaw/src/agents/system-prompt.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/system-prompt.ts)
+- [`openclaw/src/agents/pi-embedded-runner/system-prompt.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/system-prompt.ts)
+- [`openclaw/src/agents/system-prompt.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/system-prompt.ts)
 
 它依赖的 session 语义判断在：
 
-- [`openclaw/src/sessions/session-key-utils.ts`](/Users/dev/workspace2/claw_research/openclaw/src/sessions/session-key-utils.ts)
-- [`openclaw/src/routing/session-key.ts`](/Users/dev/workspace2/claw_research/openclaw/src/routing/session-key.ts)
+- [`openclaw/src/sessions/session-key-utils.ts`](/Users/dev/workspace2/agents_research/openclaw/src/sessions/session-key-utils.ts)
+- [`openclaw/src/routing/session-key.ts`](/Users/dev/workspace2/agents_research/openclaw/src/routing/session-key.ts)
 
 相关测试：
 
-- [`openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts)
-- [`openclaw/src/agents/system-prompt.test.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/system-prompt.test.ts)
+- [`openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts)
+- [`openclaw/src/agents/system-prompt.test.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/system-prompt.test.ts)
 
 ---
 
@@ -310,7 +310,7 @@ cron = 独立任务角色 -> full
 
 除了 `runEmbeddedAttempt`，在：
 
-- [`openclaw/src/agents/pi-embedded-runner/compact.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/compact.ts)
+- [`openclaw/src/agents/pi-embedded-runner/compact.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/compact.ts)
 
 也有一条相似逻辑：
 
@@ -446,8 +446,8 @@ sessionKey
 
 如果你继续顺着这条线往下读，最自然的两个方向是：
 
-1. 拆 [`openclaw/src/agents/system-prompt.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/system-prompt.ts)，看 `full` 和 `minimal` 到底差了哪些 section
-2. 拆 [`openclaw/src/agents/pi-embedded-runner/compact.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/compact.ts)，看为什么 compaction 路径的 promptMode 策略和正常 run 不一样
+1. 拆 [`openclaw/src/agents/system-prompt.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/system-prompt.ts)，看 `full` 和 `minimal` 到底差了哪些 section
+2. 拆 [`openclaw/src/agents/pi-embedded-runner/compact.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/compact.ts)，看为什么 compaction 路径的 promptMode 策略和正常 run 不一样
 
 如果你愿意，我下一步更推荐先拆第一个：  
 直接做一份 `full vs minimal system prompt` 对照地图。

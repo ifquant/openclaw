@@ -7,7 +7,7 @@
 - 它在 `runEmbeddedAttempt` 里处于什么位置
 - 它如何体现 OpenClaw 的插件兼容策略
 
-如果说 [`source_maps/openclaw_attempt_call_map.md`](/Users/dev/workspace2/claw_research/source_maps/openclaw_attempt_call_map.md) 讲的是 `runEmbeddedAttempt` 的总装配线，那这份文档讲的是其中一个关键接缝：
+如果说 [`source_maps/openclaw_attempt_call_map.md`](/Users/dev/workspace2/agents_research/source_maps/openclaw_attempt_call_map.md) 讲的是 `runEmbeddedAttempt` 的总装配线，那这份文档讲的是其中一个关键接缝：
 
 ```text
 插件 hook
@@ -40,19 +40,19 @@
 
 主函数在：
 
-- [`openclaw/src/agents/pi-embedded-runner/run/attempt.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/run/attempt.ts)
+- [`openclaw/src/agents/pi-embedded-runner/run/attempt.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/run/attempt.ts)
 
 相关支撑代码在：
 
-- [`openclaw/src/plugins/hook-runner-global.ts`](/Users/dev/workspace2/claw_research/openclaw/src/plugins/hook-runner-global.ts)
-- [`openclaw/src/plugins/hooks.ts`](/Users/dev/workspace2/claw_research/openclaw/src/plugins/hooks.ts)
-- [`openclaw/src/plugins/types.ts`](/Users/dev/workspace2/claw_research/openclaw/src/plugins/types.ts)
+- [`openclaw/src/plugins/hook-runner-global.ts`](/Users/dev/workspace2/agents_research/openclaw/src/plugins/hook-runner-global.ts)
+- [`openclaw/src/plugins/hooks.ts`](/Users/dev/workspace2/agents_research/openclaw/src/plugins/hooks.ts)
+- [`openclaw/src/plugins/types.ts`](/Users/dev/workspace2/agents_research/openclaw/src/plugins/types.ts)
 
 测试最值得看：
 
-- [`openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts)
-- [`openclaw/src/plugins/hooks.model-override-wiring.test.ts`](/Users/dev/workspace2/claw_research/openclaw/src/plugins/hooks.model-override-wiring.test.ts)
-- [`openclaw/src/plugins/hooks.before-agent-start.test.ts`](/Users/dev/workspace2/claw_research/openclaw/src/plugins/hooks.before-agent-start.test.ts)
+- [`openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/run/attempt.test.ts)
+- [`openclaw/src/plugins/hooks.model-override-wiring.test.ts`](/Users/dev/workspace2/agents_research/openclaw/src/plugins/hooks.model-override-wiring.test.ts)
+- [`openclaw/src/plugins/hooks.before-agent-start.test.ts`](/Users/dev/workspace2/agents_research/openclaw/src/plugins/hooks.before-agent-start.test.ts)
 
 ---
 

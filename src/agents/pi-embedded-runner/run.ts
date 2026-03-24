@@ -192,6 +192,19 @@ function resolveActiveErrorContext(params: {
 export async function runEmbeddedPiAgent(
   params: RunEmbeddedPiAgentParams,
 ): Promise<EmbeddedPiRunResult> {
+  /**
+   * `runEmbeddedPiAgent` 是 embedded runner 的外层调度壳：
+   * - 先做 session/global lane 排队，避免同会话和全局资源并发打架
+   * - 解析 workspace、provider/model、auth profile 与 context-window 护栏
+   * - 调用 `runEmbeddedAttempt` 执行一次真正的 agent 尝试
+   * - 根据 attempt 结果决定是否要切换 profile、降 thinking、做 compaction 恢复
+   * - 最后把内部运行结果整理成统一的 `EmbeddedPiRunResult`
+   *
+   * 这层函数的关键不在“如何具体执行一次 prompt”，而在“这一轮失败后要不要继续试，
+   * 以及下一轮该换什么条件再试”。
+   */
+  // 同一个 session 要串行，避免 transcript 和工具执行互相覆盖；
+  // 同时还要再过一层 global lane，限制整个进程级共享资源的并发压力。
   const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
   const globalLane = resolveGlobalLane(params.lane);
   const enqueueGlobal =
@@ -211,6 +224,8 @@ export async function runEmbeddedPiAgent(
   return enqueueSession(() =>
     enqueueGlobal(async () => {
       const started = Date.now();
+      // workspace 解析不是简单地“取传入路径”。
+      // 这里可能会根据 session/agent/config 回退到更安全或更稳定的目录。
       const workspaceResolution = resolveRunWorkspaceDir({
         workspaceDir: params.workspaceDir,
         sessionKey: params.sessionKey,
@@ -231,6 +246,8 @@ export async function runEmbeddedPiAgent(
       let provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
       let modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
       const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
+      // fallbackConfigured 不是“当前已经在 fallback”。
+      // 它表示：如果这轮出现某些可恢复错误，是否允许把错误升级给更高层去换模型。
       const fallbackConfigured = hasConfiguredModelFallbacks({
         cfg: params.config,
         agentId: params.agentId,
@@ -238,11 +255,12 @@ export async function runEmbeddedPiAgent(
       });
       await ensureOpenClawModelsJson(params.config, agentDir);
 
-      // Run before_model_resolve hooks early so plugins can override the
-      // provider/model before resolveModel().
+      // 这里先给插件最后一次机会改 provider/model。
+      // 必须发生在 resolveModel() 之前，因为一旦模型对象已经解析完成，
+      // 后面再改字符串就没有意义了。
       //
-      // Legacy compatibility: before_agent_start is also checked for override
-      // fields if present. New hook takes precedence when both are set.
+      // 同时继续兼容旧版 before_agent_start 里的 override 字段；
+      // 如果新旧 hook 都提供了值，以新的 before_model_resolve 为准。
       let modelResolveOverride: { providerOverride?: string; modelOverride?: string } | undefined;
       let legacyBeforeAgentStartResult: PluginHookBeforeAgentStartResult | undefined;
       const hookRunner = getGlobalHookRunner();
@@ -323,6 +341,8 @@ export async function runEmbeddedPiAgent(
         );
       }
       if (ctxGuard.shouldBlock) {
+        // 这里直接拦截，而不是让请求继续进入 attempt。
+        // 如果模型窗口小到明显不合格，后面无论怎么拼 prompt 或压历史都只是浪费时间。
         log.error(
           `blocked model (context window too small): ${provider}/${modelId} ctx=${ctxGuard.tokens} (min=${CONTEXT_WINDOW_HARD_MIN_TOKENS}) source=${ctxGuard.source}`,
         );
@@ -334,6 +354,8 @@ export async function runEmbeddedPiAgent(
 
       const authStore = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
       const preferredProfileId = params.authProfileId?.trim();
+      // lockedProfileId 表示“用户显式锁死到某个账号”。
+      // 一旦锁定，本轮 run 就不能再自动轮换到别的 profile。
       let lockedProfileId = params.authProfileIdSource === "user" ? preferredProfileId : undefined;
       if (lockedProfileId) {
         const lockedProfile = authStore.profiles[lockedProfileId];
@@ -360,6 +382,8 @@ export async function runEmbeddedPiAgent(
           : [undefined];
       let profileIndex = 0;
 
+      // thinking 级别也参与外层重试决策：某些模型不支持高 thinking，
+      // 这时会在不换模型的前提下，先降级 thinking 再试一次。
       const initialThinkLevel = params.thinkLevel ?? "off";
       let thinkLevel = initialThinkLevel;
       const attemptedThinking = new Set<ThinkLevel>();
@@ -372,6 +396,8 @@ export async function runEmbeddedPiAgent(
         profileIds?: Array<string | undefined>;
       }): FailoverReason => {
         if (params.allInCooldown) {
+          // 如果所有 profile 都在 cooldown，优先从 profile 状态反推真正原因，
+          // 而不是只看当前报错文本。
           const profileIds = (params.profileIds ?? profileCandidates).filter(
             (id): id is string => typeof id === "string" && id.length > 0,
           );
@@ -402,6 +428,8 @@ export async function runEmbeddedPiAgent(
           profileIds: profileCandidates,
         });
         if (fallbackConfigured) {
+          // 配置了模型 fallback 时，这里不要把问题吃掉。
+          // 要升级成 FailoverError，让更高层有机会直接切 provider/model。
           throw new FailoverError(message, {
             reason,
             provider,
@@ -430,6 +458,8 @@ export async function runEmbeddedPiAgent(
         apiKeyInfo = await resolveApiKeyForCandidate(candidate);
         const resolvedProfileId = apiKeyInfo.profileId ?? candidate;
         if (!apiKeyInfo.apiKey) {
+          // 某些模式（例如 aws-sdk）不需要传统 API key。
+          // 这里只在“本应拿到 key 却没有”的情况下才视为异常。
           if (apiKeyInfo.mode !== "aws-sdk") {
             throw new Error(
               `No API key resolved for provider "${model.provider}" (auth mode: ${apiKeyInfo.mode}).`,
@@ -439,6 +469,8 @@ export async function runEmbeddedPiAgent(
           return;
         }
         if (model.provider === "github-copilot") {
+          // Copilot 不能直接拿 GitHub token 当运行时 API key，
+          // 要先换成真正可调用模型接口的短期 token。
           const { resolveCopilotApiToken } =
             await import("../../providers/github-copilot-token.js");
           const copilotToken = await resolveCopilotApiToken({
@@ -455,6 +487,8 @@ export async function runEmbeddedPiAgent(
         if (lockedProfileId) {
           return false;
         }
+        // profile 轮换不仅切账号，还会把 thinking 级别和“已经试过的 thinking 集合”
+        // 一并重置，避免新账号平白继承上一账号的降级状态。
         let nextIndex = profileIndex + 1;
         while (nextIndex < profileCandidates.length) {
           const candidate = profileCandidates[nextIndex];
@@ -479,6 +513,8 @@ export async function runEmbeddedPiAgent(
       };
 
       try {
+        // 先为第一轮 run 找到一个真正可用的 profile。
+        // 如果连第一轮都选不出来，后面的 attempt 就不该启动。
         while (profileIndex < profileCandidates.length) {
           const candidate = profileCandidates[profileIndex];
           if (
@@ -510,6 +546,8 @@ export async function runEmbeddedPiAgent(
 
       const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
       const MAX_RUN_LOOP_ITERATIONS = resolveMaxRunRetryIterations(profileCandidates.length);
+      // overflowCompactionAttempts 和 toolResultTruncationAttempted 是“外层 run 级”的，
+      // 不是单个 attempt 级的。它们要跨重试轮次累计，才能防止恢复逻辑无限打转。
       let overflowCompactionAttempts = 0;
       let toolResultTruncationAttempted = false;
       const usageAccumulator = createUsageAccumulator();
@@ -523,6 +561,8 @@ export async function runEmbeddedPiAgent(
         agentDir?: RunEmbeddedPiAgentParams["agentDir"];
       }) => {
         const { profileId, reason } = failure;
+        // timeout 不记进 profile cooldown。
+        // 超时更可能是模型/网络波动，而不是这个账号凭证本身坏了。
         if (!profileId || !reason || reason === "timeout") {
           return;
         }
@@ -569,9 +609,13 @@ export async function runEmbeddedPiAgent(
           attemptedThinking.add(thinkLevel);
           await fs.mkdir(resolvedWorkspace, { recursive: true });
 
+          // Anthropic 的某些拒绝测试魔法串如果直接写进 transcript，后续会污染 session。
+          // 这里只在真正发往 Anthropic 前做脱敏替换，避免后续重试也被同一字符串毒化。
           const prompt =
             provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
 
+          // 从这里开始，才真正进入“单次具体尝试”。
+          // 这个 attempt 已经拿到了当前轮决定好的 provider/model/profile/thinking 条件。
           const attempt = await runEmbeddedAttempt({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -644,8 +688,8 @@ export async function runEmbeddedPiAgent(
           const lastAssistantUsage = normalizeUsage(lastAssistant?.usage as UsageLike);
           const attemptUsage = attempt.attemptUsage ?? lastAssistantUsage;
           mergeUsageIntoAccumulator(usageAccumulator, attemptUsage);
-          // Keep prompt size from the latest model call so session totalTokens
-          // reflects current context usage, not accumulated tool-loop usage.
+          // 这里单独保留“最后一次模型调用”的 usage，
+          // 避免 tool loop / compaction 重试把累计 usage 误当成当前上下文大小。
           lastRunPromptUsage = lastAssistantUsage ?? attemptUsage;
           const lastTurnTotal = lastAssistantUsage?.total ?? attemptUsage?.total;
           const attemptCompactionCount = Math.max(0, attempt.compactionCount ?? 0);
@@ -675,8 +719,8 @@ export async function runEmbeddedPiAgent(
                   if (isLikelyContextOverflowError(errorText)) {
                     return { text: errorText, source: "promptError" as const };
                   }
-                  // Prompt submission failed with a non-overflow error. Do not
-                  // inspect prior assistant errors from history for this attempt.
+                  // prompt 提交阶段已经明确失败，且不是 overflow。
+                  // 这时不要再回头拿历史 assistant error 混进来，否则会误判这轮失败原因。
                   return null;
                 }
                 if (assistantErrorText && isLikelyContextOverflowError(assistantErrorText)) {
@@ -687,6 +731,9 @@ export async function runEmbeddedPiAgent(
             : null;
 
           if (contextOverflowError) {
+            // context overflow 是这层函数最重的恢复分支：
+            // 先判断这次 overflow 是不是 compaction 自己失败导致的，
+            // 再决定要不要显式触发一次 overflow compaction，最后才考虑裁工具结果。
             const overflowDiagId = createCompactionDiagId();
             const errorText = contextOverflowError.text;
             const msgCount = attempt.messagesSnapshot?.length ?? 0;
@@ -699,8 +746,8 @@ export async function runEmbeddedPiAgent(
             );
             const isCompactionFailure = isCompactionFailureError(errorText);
             const hadAttemptLevelCompaction = attemptCompactionCount > 0;
-            // If this attempt already compacted (SDK auto-compaction), avoid immediately
-            // running another explicit compaction for the same overflow trigger.
+            // 如果这次 attempt 内部已经发生过自动 compaction，就不要立刻再手动 compact 一次。
+            // 否则很容易变成“同一个 overflow 触发器”连续压两遍。
             if (
               !isCompactionFailure &&
               hadAttemptLevelCompaction &&
@@ -712,8 +759,7 @@ export async function runEmbeddedPiAgent(
               );
               continue;
             }
-            // Attempt explicit overflow compaction only when this attempt did not
-            // already auto-compact.
+            // 显式 overflow compaction 只在“本轮还没自动 compact 过”时才尝试。
             if (
               !isCompactionFailure &&
               !hadAttemptLevelCompaction &&
@@ -765,9 +811,8 @@ export async function runEmbeddedPiAgent(
                 `auto-compaction failed for ${provider}/${modelId}: ${compactResult.reason ?? "nothing to compact"}`,
               );
             }
-            // Fallback: try truncating oversized tool results in the session.
-            // This handles the case where a single tool result exceeds the
-            // context window and compaction cannot reduce it further.
+            // compaction 也救不回来时，再退到“裁掉超大 tool result”这条兜底路。
+            // 它针对的是单个工具结果块本身就大得离谱，压缩历史结构也缩不下来的场景。
             if (!toolResultTruncationAttempted) {
               const contextWindowTokens = ctxInfo.tokens;
               const hasOversized = attempt.messagesSnapshot
@@ -800,8 +845,8 @@ export async function runEmbeddedPiAgent(
                   log.info(
                     `[context-overflow-recovery] Truncated ${truncResult.truncatedCount} tool result(s); retrying prompt`,
                   );
-                  // Do NOT reset overflowCompactionAttempts here — the global cap must remain
-                  // enforced across all iterations to prevent unbounded compaction cycles (OC-65).
+                  // 这里不要把 overflowCompactionAttempts 清零。
+                  // compaction 重试上限必须跨整个 run 生效，否则会重新打开无限恢复循环。
                   continue;
                 }
                 log.warn(
@@ -852,7 +897,7 @@ export async function runEmbeddedPiAgent(
 
           if (promptError && !aborted) {
             const errorText = describeUnknownError(promptError);
-            // Handle role ordering errors with a user-friendly message
+            // role 排序错误通常不是“重试一次就好”的问题，直接返回更明确的用户提示。
             if (/incorrect role information|roles must alternate/i.test(errorText)) {
               return {
                 payloads: [
@@ -875,7 +920,7 @@ export async function runEmbeddedPiAgent(
                 },
               };
             }
-            // Handle image size errors with a user-friendly message (no retry needed)
+            // 图片尺寸/大小超限也不值得内部重试，直接提示用户换图更合理。
             const imageSizeError = parseImageSizeError(errorText);
             if (imageSizeError) {
               const maxMb = imageSizeError.maxMb;
@@ -926,8 +971,8 @@ export async function runEmbeddedPiAgent(
               thinkLevel = fallbackThinking;
               continue;
             }
-            // FIX: Throw FailoverError for prompt errors when fallbacks configured
-            // This enables model fallback for quota/rate limit errors during prompt submission
+            // 如果当前 agent 配了模型 fallback，这类 prompt 阶段的可切换错误
+            // 不能只在本函数里兜底，要升级成 FailoverError 交给更高层换模型。
             if (fallbackConfigured && isFailoverErrorMessage(errorText)) {
               throw new FailoverError(errorText, {
                 reason: promptFailoverReason ?? "unknown",
@@ -979,8 +1024,8 @@ export async function runEmbeddedPiAgent(
             );
           }
 
-          // Rotate on timeout to try another account/model path in this turn,
-          // but exclude post-prompt compaction timeouts (model succeeded; no profile issue).
+          // shouldRotate 决定的是：这轮是否该尝试切到下一个 auth profile。
+          // 注意 compaction 期间超时不算 profile 问题，因为模型主调用其实已经完成了。
           const shouldRotate =
             (!aborted && failoverFailure) || (timedOut && !timedOutDuringCompaction);
 
@@ -990,9 +1035,8 @@ export async function runEmbeddedPiAgent(
                 timedOut || assistantFailoverReason === "timeout"
                   ? "timeout"
                   : (assistantFailoverReason ?? "unknown");
-              // Skip cooldown for timeouts: a timeout is model/network-specific,
-              // not an auth issue. Marking the profile would poison fallback models
-              // on the same provider (e.g. gpt-5.3 timeout blocks gpt-5.2).
+              // timeout 不记 cooldown。否则会把“网络/模型抖动”误伤成“账号坏了”，
+              // 连同同 provider 下其他 fallback 模型一起污染掉。
               await maybeMarkAuthProfileFailure({
                 profileId: lastProfileId,
                 reason,
@@ -1013,7 +1057,8 @@ export async function runEmbeddedPiAgent(
             }
 
             if (fallbackConfigured) {
-              // Prefer formatted error message (user-friendly) over raw errorMessage
+              // 这里优先用格式化后的错误文案，把 provider 特定错误翻成更可读的文本，
+              // 再升级成 FailoverError 交给更高层模型切换逻辑。
               const message =
                 (lastAssistant
                   ? formatAssistantErrorText(lastAssistant, {
@@ -1053,11 +1098,8 @@ export async function runEmbeddedPiAgent(
           if (usage && lastTurnTotal && lastTurnTotal > 0) {
             usage.total = lastTurnTotal;
           }
-          // Extract the last individual API call's usage for context-window
-          // utilization display. The accumulated `usage` sums input tokens
-          // across all calls (tool-use loops, compaction retries), which
-          // overstates the actual context size. `lastCallUsage` reflects only
-          // the final call, giving an accurate snapshot of current context.
+          // usage 是整轮 run 的累计量，但 context window 展示更需要“最后一次调用”的快照。
+          // 所以这里同时保留累计 usage 和 lastCallUsage 两套视角。
           const lastCallUsage = normalizeUsage(lastAssistant?.usage as UsageLike);
           const promptTokens = derivePromptTokens(lastRunPromptUsage);
           const agentMeta: EmbeddedPiAgentMeta = {
@@ -1087,9 +1129,9 @@ export async function runEmbeddedPiAgent(
             didSendViaMessagingTool: attempt.didSendViaMessagingTool,
           });
 
-          // Timeout aborts can leave the run without any assistant payloads.
-          // Emit an explicit timeout error instead of silently completing, so
-          // callers do not lose the turn as an orphaned user message.
+          // 超时中断可能让这一轮完全没有 assistant payload。
+          // 这里要显式吐一个 timeout 错误，而不是静默成功返回，
+          // 否则调用方看到的只会是一个孤立 user turn。
           if (timedOut && !timedOutDuringCompaction && payloads.length === 0) {
             return {
               payloads: [
@@ -1137,7 +1179,8 @@ export async function runEmbeddedPiAgent(
               agentMeta,
               aborted,
               systemPromptReport: attempt.systemPromptReport,
-              // Handle client tool calls (OpenResponses hosted tools)
+              // 如果这轮命中了宿主侧托管 client tool，就把 stopReason 和 pendingToolCalls
+              // 按 OpenResponses 风格补回去，方便更上层继续接这个 tool call。
               stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
               pendingToolCalls: attempt.clientToolCall
                 ? [
@@ -1157,6 +1200,8 @@ export async function runEmbeddedPiAgent(
           };
         }
       } finally {
+        // 外层调度壳无论走到哪条分支，都要把 cwd 还原。
+        // 这层和 attempt 都可能切目录，所以最终出口必须做一次卫生收尾。
         process.chdir(prevCwd);
       }
     }),

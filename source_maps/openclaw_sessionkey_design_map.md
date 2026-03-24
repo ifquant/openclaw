@@ -4,7 +4,7 @@
 
 `sessionKey` 在 OpenClaw 里到底是什么，为什么它不是一个普通的会话 ID。
 
-如果 [`source_maps/openclaw_attempt_call_map.md`](/Users/dev/workspace2/claw_research/source_maps/openclaw_attempt_call_map.md) 讲的是一次 run 的装配流程，那这份文档讲的是：
+如果 [`source_maps/openclaw_attempt_call_map.md`](/Users/dev/workspace2/agents_research/source_maps/openclaw_attempt_call_map.md) 讲的是一次 run 的装配流程，那这份文档讲的是：
 
 - OpenClaw 如何给“同一条会话生命线”命名
 - 这个名字里为什么塞了 agent、channel、chat type、thread、subagent、ACP 等信息
@@ -62,8 +62,8 @@ sessionKey = agent 作用域 + 会话路由语义 + 会话类型语义 + 特殊�
 
 你读 `sessionKey`，先抓这两个文件：
 
-- [`openclaw/src/sessions/session-key-utils.ts`](/Users/dev/workspace2/claw_research/openclaw/src/sessions/session-key-utils.ts)
-- [`openclaw/src/routing/session-key.ts`](/Users/dev/workspace2/claw_research/openclaw/src/routing/session-key.ts)
+- [`openclaw/src/sessions/session-key-utils.ts`](/Users/dev/workspace2/agents_research/openclaw/src/sessions/session-key-utils.ts)
+- [`openclaw/src/routing/session-key.ts`](/Users/dev/workspace2/agents_research/openclaw/src/routing/session-key.ts)
 
 可以把它们分工记成：
 
@@ -643,12 +643,12 @@ sessionKey = 这条生命线是谁
 
 建议顺序：
 
-1. [`openclaw/src/sessions/session-key-utils.ts`](/Users/dev/workspace2/claw_research/openclaw/src/sessions/session-key-utils.ts)
-2. [`openclaw/src/routing/session-key.ts`](/Users/dev/workspace2/claw_research/openclaw/src/routing/session-key.ts)
-3. [`openclaw/src/channels/session.ts`](/Users/dev/workspace2/claw_research/openclaw/src/channels/session.ts)
-4. [`openclaw/src/sessions/send-policy.ts`](/Users/dev/workspace2/claw_research/openclaw/src/sessions/send-policy.ts)
-5. [`openclaw/src/telegram/bot-message-context.ts`](/Users/dev/workspace2/claw_research/openclaw/src/telegram/bot-message-context.ts) 或 [`openclaw/src/imessage/monitor/inbound-processing.ts`](/Users/dev/workspace2/claw_research/openclaw/src/imessage/monitor/inbound-processing.ts)
-6. 回到 [`openclaw/src/agents/pi-embedded-runner/run/attempt.ts`](/Users/dev/workspace2/claw_research/openclaw/src/agents/pi-embedded-runner/run/attempt.ts) 看 `isSubagentSessionKey`、`sessionKey` 参数如何参与 run
+1. [`openclaw/src/sessions/session-key-utils.ts`](/Users/dev/workspace2/agents_research/openclaw/src/sessions/session-key-utils.ts)
+2. [`openclaw/src/routing/session-key.ts`](/Users/dev/workspace2/agents_research/openclaw/src/routing/session-key.ts)
+3. [`openclaw/src/channels/session.ts`](/Users/dev/workspace2/agents_research/openclaw/src/channels/session.ts)
+4. [`openclaw/src/sessions/send-policy.ts`](/Users/dev/workspace2/agents_research/openclaw/src/sessions/send-policy.ts)
+5. [`openclaw/src/telegram/bot-message-context.ts`](/Users/dev/workspace2/agents_research/openclaw/src/telegram/bot-message-context.ts) 或 [`openclaw/src/imessage/monitor/inbound-processing.ts`](/Users/dev/workspace2/agents_research/openclaw/src/imessage/monitor/inbound-processing.ts)
+6. 回到 [`openclaw/src/agents/pi-embedded-runner/run/attempt.ts`](/Users/dev/workspace2/agents_research/openclaw/src/agents/pi-embedded-runner/run/attempt.ts) 看 `isSubagentSessionKey`、`sessionKey` 参数如何参与 run
 
 ---
 

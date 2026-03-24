@@ -7,7 +7,7 @@
 - OpenClaw 的工具系统是如何按 session、sandbox、channel、policy、provider 逐层装出来的
 - 为什么这个函数是 `runEmbeddedAttempt` 的核心枢纽之一
 
-如果 [`source_maps/openclaw_attempt_call_map.md`](/Users/dev/workspace2/claw_research/source_maps/openclaw_attempt_call_map.md) 讲的是 run 的总装配线，那么这份文档讲的是其中最关键的一条支线：
+如果 [`source_maps/openclaw_attempt_call_map.md`](/Users/dev/workspace2/agents_research/source_maps/openclaw_attempt_call_map.md) 讲的是 run 的总装配线，那么这份文档讲的是其中最关键的一条支线：
 
 ```text
 当前会话上下文
